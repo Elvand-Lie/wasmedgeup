@@ -1,0 +1,165 @@
+name: GNU glibc compatibility probe
+
+on:
+  push:
+    branches: [ci/glibc-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository != 'WasmEdge/wasmedgeup'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    env:
+      package_name: wasmedgeup
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install GNU build toolchain
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --require-hashes --only-binary=:all: --no-deps \
+            -r .github/zigbuild-requirements.txt
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+      - name: Build GNU artifact
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: cargo zigbuild --release --target ${{ matrix.target }}.2.28
+
+      - name: Check GNU glibc requirement
+        if: endsWith(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          max_glibc=$(readelf --version-info target/${{ matrix.target }}/release/${{ env.package_name }} |
+            grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -Vu | tail -n 1)
+          echo "Highest required glibc version: $max_glibc"
+          test "$(printf '%s\n' GLIBC_2.28 "$max_glibc" | sort -V | tail -n 1)" = GLIBC_2.28
+
+      - name: Record artifact identity
+        run: |
+          git rev-parse HEAD
+          rustc --version
+          sccache --version
+          "$RUNNER_TEMP/zigbuild/bin/pip" show cargo-zigbuild ziglang | grep -E '^(Name|Version):'
+          "$RUNNER_TEMP/zigbuild/bin/python" -m ziglang version
+          sha256sum Cargo.toml Cargo.lock .github/workflows/release.yml .github/zigbuild-requirements.txt
+          sha256sum target/${{ matrix.target }}/release/${{ env.package_name }}
+          stat -c '%n %s bytes' target/${{ matrix.target }}/release/${{ env.package_name }}
+          readelf -S --wide target/${{ matrix.target }}/release/${{ env.package_name }}
+          readelf -p .comment target/${{ matrix.target }}/release/${{ env.package_name }}
+          readelf -d target/${{ matrix.target }}/release/${{ env.package_name }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ env.package_name }}
+          if-no-files-found: error
+
+  smoke-x86_64:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:20.04, ubuntu:22.04, ubuntu:24.04, debian:12, rockylinux:8]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: probe-bin
+      - name: Check x86_64 on ${{ matrix.image }}
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: |
+          chmod +x probe-bin/wasmedgeup
+          docker run --rm --platform linux/amd64 -i \
+            -v "$PWD/probe-bin:/probe:ro" "$TEST_IMAGE" bash -s <<'SMOKE'
+          set -euo pipefail
+          if command -v apt-get >/dev/null; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates libstdc++6
+          else
+            yum install -y ca-certificates libstdc++
+          fi
+          uname -m
+          cat /etc/os-release
+          ldd --version
+          sha256sum /probe/wasmedgeup
+          failed=0
+          check() {
+            local label=$1
+            shift
+            if "$@"; then
+              echo "PASS: $label"
+            else
+              echo "FAIL: $label"
+              failed=1
+            fi
+          }
+          check version timeout 120 /probe/wasmedgeup --version
+          check remote-list timeout 180 /probe/wasmedgeup list --remote
+          check install timeout 600 /probe/wasmedgeup install 0.18.1 -p /tmp/x
+          check runtime-version env LD_LIBRARY_PATH=/tmp/x/lib timeout 120 /tmp/x/bin/wasmedge --version
+          exit "$failed"
+          SMOKE
+
+  smoke-aarch64:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:20.04, ubuntu:22.04, debian:12]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aarch64-unknown-linux-gnu
+          path: probe-bin
+      - name: Check aarch64 on ${{ matrix.image }}
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: |
+          chmod +x probe-bin/wasmedgeup
+          docker run --rm --platform linux/arm64 -i \
+            -v "$PWD/probe-bin:/probe:ro" "$TEST_IMAGE" bash -s <<'SMOKE'
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates libstdc++6
+          uname -m
+          cat /etc/os-release
+          ldd --version
+          sha256sum /probe/wasmedgeup
+          failed=0
+          check() {
+            local label=$1
+            shift
+            if "$@"; then
+              echo "PASS: $label"
+            else
+              echo "FAIL: $label"
+              failed=1
+            fi
+          }
+          check version timeout 120 /probe/wasmedgeup --version
+          check remote-list timeout 180 /probe/wasmedgeup list --remote
+          check install timeout 600 /probe/wasmedgeup install 0.18.1 -p /tmp/x
+          check runtime-version env LD_LIBRARY_PATH=/tmp/x/lib timeout 120 /tmp/x/bin/wasmedge --version
+          exit "$failed"
+          SMOKE
